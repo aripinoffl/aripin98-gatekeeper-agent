@@ -1,0 +1,1 @@
+{"functions":{"api/agent.mjs":{"maxDuration":60,"memory":1024}},"rewrites":[{"destination":"/api/agent","source":"/agent"}]}
