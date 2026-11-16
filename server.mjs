@@ -7,6 +7,10 @@
  * a real Groth16 proof locally with snarkjs against the official gatekeeper
  * circuit, and returns a signed JSON response.
  *
+ * The same endpoint also answers "Steal the VFY" turns: envelopes with
+ * eventId "steal-the-vfy" are routed (after the same signature check) to
+ * steal-strategy.mjs; all Gatekeeper behavior is unchanged.
+ *
  * Config is env-only (see .env.example / README.md). No secrets in code.
  */
 
@@ -16,6 +20,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as snarkjs from "snarkjs";
+import { handleStealTurn, computeCommitment } from "./steal-strategy.mjs";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -96,6 +101,46 @@ export function deriveSalt(secret, taskId) {
     .digest();
   return BigInt("0x" + digest.toString("hex")) % BN128_PRIME;
 }
+
+// ---------------------------------------------------------------------------
+// Steal the VFY (second track on this same endpoint)
+//
+// Envelopes whose eventId is "steal-the-vfy" are routed to
+// handleStealTurn (steal-strategy.mjs) after the shared HMAC verification;
+// every other envelope follows the Gatekeeper flow below, unchanged.
+//
+// The committed policy is params [10,0,0,0,0,0,0,0] ("always EXTRACT 10").
+// Its circuit salt is DERIVED from the existing HMAC secret —
+// HMAC-SHA256(secret, "steal-the-vfy-salt") reduced mod p, the same
+// construction deriveSalt uses — so no new secret or file is introduced.
+// The commitment that must be registered on the dashboard for this agent
+// is Poseidon(params, salt); it is computed and logged once at startup
+// (the hash only — never the secret or the salt).
+// ---------------------------------------------------------------------------
+
+export function deriveStealSalt(secret) {
+  const digest = crypto
+    .createHmac("sha256", secret)
+    .update("steal-the-vfy-salt")
+    .digest();
+  return BigInt("0x" + digest.toString("hex")) % BN128_PRIME;
+}
+
+const STEAL_PARAMS = [10, 0, 0, 0, 0, 0, 0, 0];
+const stealConfig = { params: STEAL_PARAMS, salt: deriveStealSalt(SECRET) };
+
+computeCommitment(STEAL_PARAMS, stealConfig.salt)
+  .then((c) => {
+    console.log(
+      `steal-the-vfy: strategy commitment ${c.hex} ` +
+        `(params [${STEAL_PARAMS.join(",")}], salt derived from the HMAC secret)`,
+    );
+  })
+  .catch((e) => {
+    // Not fatal to the Gatekeeper flow; steal turns will fail closed in
+    // handleStealTurn if the commitment cannot be recomputed there.
+    console.error(`steal-the-vfy: startup commitment computation failed: ${e.message}`);
+  });
 
 // ---------------------------------------------------------------------------
 // Field conversion + input parsing
@@ -538,6 +583,20 @@ async function handlePost(req, res) {
       400,
       JSON.stringify({ decision: "REJECT", reason_code: "INVALID_TASK" }),
     );
+  }
+
+  // Steal the VFY turns share this endpoint and its HMAC scheme but are
+  // NOT Gatekeeper tasks: route them on eventId BEFORE any Gatekeeper
+  // envelope validation (type/task fields) runs. The response is signed
+  // exactly like every other post-parse response (sendSigned).
+  if (envelope?.eventId === "steal-the-vfy") {
+    const t0 = Date.now();
+    const result = await handleStealTurn(envelope, stealConfig);
+    console.log(
+      `steal turn ${envelope.matchId} #${envelope.turn} -> ${result.action.type} ` +
+        `in ${Date.now() - t0} ms`,
+    );
+    return sendSigned(res, 200, JSON.stringify(result));
   }
 
   if (envelope?.type === PREFLIGHT_TYPE) {
